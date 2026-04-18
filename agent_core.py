@@ -12,67 +12,80 @@ from __future__ import annotations
 import json
 import os
 from json import JSONDecodeError
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 from openai import OpenAI
+from openai.types.chat import (
+    ChatCompletionFunctionToolParam,
+    ChatCompletionMessageParam,
+)
 
 from tools_engine import recommend_and_train_model, run_automated_eda, suggest_hypothesis
 
 
-def _build_tools_schema() -> list[dict[str, Any]]:
+def _build_tools_schema() -> list[ChatCompletionFunctionToolParam]:
     """Return OpenAI tool schemas compatible with LM Studio function calling."""
     return [
-        {
-            "type": "function",
-            "function": {
-                "name": "eda",
-                "description": (
-                    "Yuklenen veri seti icin otomatik EDA calistirir; veri tipleri, "
-                    "eksik degerler ve sayisal korelasyon bilgisi dondurur."
-                ),
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "hipotez",
-                "description": (
-                    "Verilen hedef degisken adina gore 2-3 mantiksal hipotez onerir."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target_col": {
-                            "type": "string",
-                            "description": "Hedef degiskenin kolon adi.",
-                        }
-                    },
-                    "required": ["target_col"],
+        cast(
+            ChatCompletionFunctionToolParam,
+            {
+                "type": "function",
+                "function": {
+                    "name": "eda",
+                    "description": (
+                        "Yuklenen veri seti icin otomatik EDA calistirir; veri tipleri, "
+                        "eksik degerler ve sayisal korelasyon bilgisi dondurur."
+                    ),
+                    "parameters": {"type": "object", "properties": {}, "required": []},
                 },
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "model_egit",
-                "description": (
-                    "Hedef degiskene gore siniflandirma veya regresyon modeli secip "
-                    "Random Forest ile egitir ve skor dondurur."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target_col": {
-                            "type": "string",
-                            "description": "Egitim icin hedef degiskenin kolon adi.",
-                        }
+        ),
+        cast(
+            ChatCompletionFunctionToolParam,
+            {
+                "type": "function",
+                "function": {
+                    "name": "hipotez",
+                    "description": (
+                        "Verilen hedef degisken adina gore 2-3 mantiksal hipotez onerir."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target_col": {
+                                "type": "string",
+                                "description": "Hedef degiskenin kolon adi.",
+                            }
+                        },
+                        "required": ["target_col"],
                     },
-                    "required": ["target_col"],
                 },
             },
-        },
+        ),
+        cast(
+            ChatCompletionFunctionToolParam,
+            {
+                "type": "function",
+                "function": {
+                    "name": "model_egit",
+                    "description": (
+                        "Hedef degiskene gore siniflandirma veya regresyon modeli secip "
+                        "Random Forest ile egitir ve skor dondurur."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target_col": {
+                                "type": "string",
+                                "description": "Egitim icin hedef degiskenin kolon adi.",
+                            }
+                        },
+                        "required": ["target_col"],
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -90,9 +103,10 @@ def _dispatch_tool(tool_name: str, arguments: dict[str, Any], df: pd.DataFrame) 
 def run_agent(
     user_message: str,
     df: pd.DataFrame,
-    model: str = "google/gemma-3-4b",
+    model: str = "",
     api_key: str = "lm-studio",
     max_iterations: int = 6,
+    lm_studio_url: str = "http://localhost:1234/v1",
 ) -> str:
     """Run a full OpenAI-style tool-calling loop against LM Studio.
 
@@ -108,13 +122,14 @@ def run_agent(
         model: LM Studio model id (e.g. "qwen2.5-7b-instruct").
         api_key: API key placeholder for OpenAI SDK. LM Studio accepts any string.
         max_iterations: Safety limit for tool-calling loop.
+        lm_studio_url: LM Studio local endpoint (default: http://localhost:1234/v1).
 
     Returns:
         Final assistant response text.
 
     Raises:
         ValueError: If input message/data is invalid or no final response is produced.
-        RuntimeError: If loop exceeds max_iterations.
+        RuntimeError: If loop exceeds max_iterations or LM Studio bağlantısı başarısız.
     """
     if not isinstance(user_message, str) or not user_message.strip():
         raise ValueError("user_message must be a non-empty string.")
@@ -123,11 +138,20 @@ def run_agent(
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1.")
 
-    client = OpenAI(base_url="http://localhost:1234/v1", api_key=api_key)
+    # LM Studio bağlantısını kur
+    try:
+        client = OpenAI(base_url=lm_studio_url, api_key=api_key)
+    except Exception as exc:
+        raise RuntimeError(
+            f"LM Studio bağlantısı başarısız: {lm_studio_url}\n"
+            f"Lütfen LM Studio'yu başlat ve Local Server'ı Running yap.\n"
+            f"Hata: {exc}"
+        ) from exc
+
     selected_model = model or os.getenv("LM_STUDIO_MODEL", "google/gemma-3-4b")
     tools = _build_tools_schema()
 
-    messages: list[dict[str, Any]] = [
+    messages: list[ChatCompletionMessageParam] = [
         {
             "role": "system",
             "content": (
@@ -139,33 +163,55 @@ def run_agent(
     ]
 
     for _ in range(max_iterations):
-        completion = client.chat.completions.create(
-            model=selected_model,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-        )
+        try:
+            completion = client.chat.completions.create(
+                model=selected_model,
+                messages=cast(list[ChatCompletionMessageParam], messages),
+                tools=tools,
+                tool_choice="auto",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"LM Studio API çağrısı başarısız oldu.\n"
+                f"Model: {selected_model}\n"
+                f"Endpoint: {lm_studio_url}\n"
+                f"Lütfen LM Studio'da model yüklendiğini kontrol et.\n"
+                f"Hata: {exc}"
+            ) from exc
+
+        if not completion.choices:
+            raise RuntimeError("LM Studio boş yanıt döndürdü (choices listesi boş).")
         assistant_message = completion.choices[0].message
 
         # Convert assistant message to plain dict for next turn context.
-        messages.append(assistant_message.model_dump(exclude_none=True))
+        msg_dict = assistant_message.model_dump(exclude_none=True)
+        if "content" not in msg_dict:
+            msg_dict["content"] = None
+        messages.append(cast(ChatCompletionMessageParam, msg_dict))
 
         tool_calls = assistant_message.tool_calls or []
         if not tool_calls:
             return assistant_message.content or ""
 
         for tc in tool_calls:
+            # Type narrowing: sadece function tool call'lari isle.
+            # Bu sayede Pylance tc.function'a erisime izin verir ve
+            # custom tool call gelirse sessizce atlariz.
+            if tc.type != "function":
+                continue
+
             tool_name = tc.function.name
+            tool_result: Any = None
 
             # Local models may emit malformed JSON; guard with try-except.
             try:
                 raw_args = tc.function.arguments or "{}"
                 parsed_args = json.loads(raw_args)
                 if not isinstance(parsed_args, dict):
-                    raise ValueError("Tool arguments must decode to a JSON object.")
-            except JSONDecodeError as exc:
-                tool_result: Any = {
-                    "error": "JSONDecodeError",
+                    raise TypeError("Tool arguments must decode to a JSON object.")
+            except (JSONDecodeError, TypeError) as exc:
+                tool_result = {
+                    "error": type(exc).__name__,
                     "message": "Tool argumanlari gecerli JSON degil.",
                     "raw_arguments": tc.function.arguments,
                     "details": str(exc),
@@ -187,12 +233,15 @@ def run_agent(
                     }
 
             messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": tool_name,
-                    "content": json.dumps(tool_result, ensure_ascii=False, default=str),
-                }
+                cast(
+                    ChatCompletionMessageParam,
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tool_name,
+                        "content": json.dumps(tool_result, ensure_ascii=False, default=str),
+                    },
+                )
             )
 
     raise RuntimeError(

@@ -101,8 +101,17 @@ if uploaded_file is not None:
             with st.spinner("Ajan düşünüyor..."):
                 try:
                     answer = run_agent(user_message=user_prompt, df=st.session_state.df)
+                except RuntimeError as exc:
+                    # LM Studio bağlantı hatası
+                    answer = f"""❌ **LM Studio Hatası**\n\n{exc}\n\n
+**Çözüm adımları:**
+1. LM Studio uygulamasını aç
+2. Local Server durumunu \"Running\" yap
+3. En az bir model yükle (örn: `google/gemma-3-4b`)
+4. Tekrar dene"""
                 except Exception as exc:  # noqa: BLE001
-                    answer = f"Ajan çalışırken hata oluştu: {exc}"
+                    # Diğer hatalar
+                    answer = f"⚠️ **Hata:** {exc}"
                 st.markdown(answer)
 
         st.session_state.chat_messages.append({"role": "assistant", "content": answer})
